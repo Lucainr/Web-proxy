@@ -11,11 +11,10 @@
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
 int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize);
+void serve_static(int fd, char *filename, int filesize, char *method);
 void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
-void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
-                 char *longmsg);
+void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
 int main(int argc, char **argv)
 {
@@ -40,7 +39,8 @@ int main(int argc, char **argv)
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE,
                 0);
     printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);  // line:netp:tiny:doit
+
+    doit(connfd);
     Close(connfd); // line:netp:tiny:close
   }
 }
@@ -53,37 +53,44 @@ void doit(int fd) {
   char filename[MAXLINE], cgiargs[MAXLINE];
   rio_t rio;
 
-  /* Request line과 Request header를 읽는 곳*/
-  rio_readinitb(&rio, fd);
-  rio_readlineb(&rio, buf, MAXLINE);
-  printf("Request headers : \n");
-  printf("%s", buf);
-  sscanf(buf, "%s %s %s", method, uri, version);
-  
-  /* main 루틴 */
-  if (strcasecmp(method, "GET")) {
-    clienterror(fd, method, "501", "적용되지 않음", "Tiny는 이 요청을 적용하지 않음");
+  /* Request line과 Request headers 읽기 + 콘솔 echo */
+  Rio_readinitb(&rio, fd);
+
+  /* 요청 라인 */
+  if (Rio_readlineb(&rio, buf, MAXLINE) <= 0) {
     return;
   }
-  read_requesthdrs(&rio); // request header를 읽는다
 
-  /* GET Method 요청에서 URI를 분석 */
+  printf("Request line: %s", buf);                  // 라벨 명확히
+  sscanf(buf, "%s %s %s", method, uri, version);
+
+  /* 메서드 체크 (과제 기본: GET) */
+  if (!(strcasecmp(method, "GET") == 0 || strcasecmp(method, "HEAD") == 0)) {
+    clienterror(fd, method, "501", "Not Implemented 적용되지 않음", "Tiny는 이 메서드를 지원하지 않습니다");
+    return;
+  }
+
+  /* 요청 헤더들 (빈 줄까지) */
+  printf("Request headers:\n");
+  read_requesthdrs(&rio);
+
+  /* GET 요청에서 URI 파싱 */
   is_static = parse_uri(uri, filename, cgiargs);
-  
   if (stat(filename, &sbuf) < 0) {
-    clienterror(fd, filename, "404", "Not found 찾을 수 없음", "Tiny가 이 파일을 읽지 못합니다.");
+    clienterror(fd, filename, "404", "Not Found 찾을 수 없음", "Tiny가 이 파일을 읽지 못합니다");
     return;
   }
 
   if (is_static) {
     if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
-      clienterror(fd, filename, "403", "Forbidden 금지됨", "Tiny가 이 파일을 읽지 못함");
+      clienterror(fd, filename, "403", "Forbidden 금지됨", "Tiny가 이 파일을 읽지 못합니다");
       return;
     }
-    serve_static(fd, filename, sbuf.st_size);
+    serve_static(fd, filename, sbuf.st_size, method);
   } else {
-    if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
-      clienterror(fd, filename, "403", "Forbidden 제한됨", "Tiny가 CGI program을 실행할 수 없습니다. (CGI인자 String으로 분석할 수 없음.)");
+    /* 동적 컨텐츠는 실행 권한 필요 */
+    if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) {
+      clienterror(fd, filename, "403", "Forbidden 제한됨", "Tiny가 CGI program을 실행할 수 없습니다");
       return;
     }
     serve_dynamic(fd, filename, cgiargs);
@@ -150,7 +157,7 @@ int parse_uri(char *uri, char *filename, char *cgiargs) {
   }
 }
 
-void serve_static(int fd, char *filename, int filesize) {
+void serve_static(int fd, char *filename, int filesize, char *method) {
   int srcfd;
   char *srcp, filetype[MAXLINE], buf[MAXBUF];
 
@@ -162,18 +169,34 @@ void serve_static(int fd, char *filename, int filesize) {
   sprintf(buf, "%sContent-length: %d\r\n", buf, filesize);
   sprintf(buf, "%sContent-type: %s\r\n\r\n", buf, filetype);
   Rio_writen(fd, buf, strlen(buf));
+ 
   printf("Response headers : \n");
   printf("%s", buf);
+  
+  /* 숙제 11.11 - HEAD Method */
+  if (strcasecmp(method, "HEAD") == 0) {
+    return;
+  }
+  /* Response body를 Client에게 보냄 - Tiny 기본*/
+  // srcfd = open(filename, O_RDONLY, 0);                            // 읽기 위해서 filename을 open하고 식별자를 얻어온다.
+  // // mmap을 호출하면 파일 식별자 srcfd의 첫 번째 filesize 바이트를 주소 srcp에서 시작하는 사적 읽기-허용 가상메모리 영역으로 매핑함
+  // srcp = mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);     // 리눅스 mmap함수는 요청한 파일을 가상메모리 영역으로 매핑
+  // // 파일을 메모리로 매핑한 후에 더 이상 이 식별자는 필요 없음.
+  // close(srcfd);   // 그래서 이 파일을 닫음. 이렇게 하지 않으면 메모리 누수가 발생할 수 있다.
+  // // Rio_writen 함수는 주소 srcp에서 시작하는 filesize 바이트를 클라이언트의 연결 식별자(fd)로 복사한다.
+  // Rio_writen(fd, srcp, filesize); // 파일을 Client에게 전송
+  // Munmap(srcp, filesize); // 매핑된 가상메모리 주소를 반환한다. 이것도 메모리 누수를 피하는데 중요함
 
-  /* Response body를 Client에게 보냄 */
-  srcfd = open(filename, O_RDONLY, 0);                            // 읽기 위해서 filename을 open하고 식별자를 얻어온다.
-  // mmap을 호출하면 파일 식별자 srcfd의 첫 번째 filesize 바이트를 주소 srcp에서 시작하는 사적 읽기-허용 가상메모리 영역으로 매핑함
-  srcp = mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);     // 리눅스 mmap함수는 요청한 파일을 가상메모리 영역으로 매핑
-  // 파일을 메모리로 매핑한 후에 더 이상 이 식별자는 필요 없음.
-  close(srcfd);   // 그래서 이 파일을 닫음. 이렇게 하지 않으면 메모리 누수가 발생할 수 있다.
-  // Rio_writen 함수는 주소 srcp에서 시작하는 filesize 바이트를 클라이언트의 연결 식별자(fd)로 복사한다.
-  Rio_writen(fd, srcp, filesize); // 파일을 Client에게 전송
-  Munmap(srcp, filesize); // 매핑된 가상메모리 주소를 반환한다. 이것도 메모리 누수를 피하는데 중요함
+  /* Response body를 Client에게 보냄 - Tiny malloc + read, write, free 숙제 11.9*/
+  srcfd = open(filename, O_RDONLY, 0);
+  char *buff = malloc(filesize);
+  if (buff == NULL) {
+      unix_error("malloc error");
+  }
+  Rio_readn(srcfd, buff, filesize);   // 파일 내용을 읽고
+  close(srcfd);
+  Rio_writen(fd, buff, filesize);     // 클라이언트에게 전송
+  free(buff);                         // 메모리 해제
 }
 
 /* 파일 타입 반환 - 파일 이름의 접미어 부분을 검사함으로써 파일 타입을 반환함 */
@@ -186,6 +209,8 @@ void get_filetype(char *filename, char *filetype) {
     strcpy(filetype, "image/png");
   } else if (strstr(filename, ".jpg")) {
     strcpy(filetype, "image/jpeg");
+  } else if (strstr(filename, ".mpg")) {    // 숙제 11.7
+    strcpy(filetype, "video/mpeg");
   } else {
     strcpy(filetype, "text/plain");
   }
