@@ -9,6 +9,20 @@
  */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define NTHREADS 4
+#define SBUFSIZE 16
+
+typedef struct {
+  int *buf;                 // 연결 파일디스크립터(connfd) 저장 배열
+  int front;                // 꺼낼 위치 (dequeue index)
+  int rear;                 // 넣을 위치 (enqueue index)
+  int n;                    // 버퍼 전체 크기
+
+  pthread_mutex_t mutex;    // 큐 접근 동기화용
+  pthread_cond_t slots;     // 빈 슬롯 발생 시 signal
+  pthread_cond_t items;     // 아이템 도착 시 signal
+} sbuf_t;
+
 
 /* 프록시의 핵심 함수 프로토타입 선언
  * - doit: 클라이언트 1개 연결에 대한 전체 요청-응답 처리
@@ -22,6 +36,14 @@ int parse_uri(char *uri, char *hostname, char *path, char *port);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 void forward_request_headers(rio_t *client_rio, int serverfd, const char *hostname, const char *port, const char *method, const char *path);
 void relay_response(int serverfd, int clientfd);
+void *thread(void *vargp);
+
+
+/* Thread pool 함수 */
+void subf_init(sbuf_t *sp, int n);        // 큐 초기화 함수
+void subf_insert(sbuf_t *sp, int item);   // connfd 저장 (enqueue)
+int subf_remove(sbuf_t *sp);              // connfd 꺼내기 (dequeue)
+
 
 /* 과제에서 제공하는 고정 User-Agent 헤더 문자열
  * 프록시는 클라이언트의 User-Agent를 그대로 전달하지 않고
@@ -32,9 +54,11 @@ static const char *user_agent_hdr =
     "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
     "Firefox/10.0.3\r\n";
 
+sbuf_t sbuf;
+
 int main(int argc, char **argv)
 {
-  int listenfd, clientfd;                         // 수신용 리스닝 소켓, 각 클라이언트 연결용 소켓
+  int listenfd, *clientfd;                        // 수신용 리스닝 소켓, 각 클라이언트 연결용 소켓
   char hostname[MAXLINE], port[MAXLINE];          // 접속한 클라이언트의 역방향 이름, 포트 문자열
   socklen_t clientlen;                            // 소켓 주소 구조체 크기
   struct sockaddr_storage clientaddr;             // 클라이언트 주소를 담을 범용 구조체
@@ -49,9 +73,17 @@ int main(int argc, char **argv)
     exit(1);
   }
 
+  subf_init(&sbuf, SBUFSIZE);                     // 작업 큐 초기화
+
+  pthread_t tid;
+  for (int i = 0; i <NTHREADS; i++) {
+    pthread_create(&tid, NULL, thread, NULL);     // 워커 생성
+  }
+
   /* 리스닝 소켓 생성
    * - Open_listenfd는 csapp의 래퍼로, 에러 시 내부에서 처리 후 적절히 종료
    * - 반환된 listenfd로 accept를 반복
+   * - main thread : 클라이언트 연결 수락 및 큐에 삽입
    */
   listenfd = Open_listenfd(argv[1]);
   while (1)
@@ -74,12 +106,13 @@ int main(int argc, char **argv)
      * - HTTP 요청 1개를 처리하고 응답 후 소켓을 닫음
      * - 프록시 과제의 기본 요건에서는 keep-alive 대신 Connection: close로 마무리
      */
-    doit(clientfd);
+    // doit(clientfd);
 
     /* 클라이언트 소켓 종료
      * - 한 요청-응답 트랜잭션 완료 후 닫음
      */
-    Close(clientfd); // line:netp:tiny:close
+    // Close(clientfd); // line:netp:tiny:close
+    subf_insert(&sbuf, clientfd);     // clientfd를 큐에 삽입
   }
 }
 
@@ -467,4 +500,60 @@ void relay_response(int serverfd, int clientfd) {
             Rio_writen(clientfd, buf, n);
         }
     }
+}
+
+/* 작업 큐 구조체를 초기화하여 버퍼와 동기화 도구(mutex, 조건 변수)를 사용할 준비를 하는 함수 */
+void subf_init(sbuf_t *sp, int n) {
+  sp -> buf = calloc(n, sizeof(int));     // connfd 저장용 배열 할당
+  sp->n = n;                              // 버퍼 크기 저장
+  sp->front = sp->rear = 0;               // 초기 인덱스느 0 (비어 있음)
+  pthread_mutex_init(&sp->mutex, NULL);   // mutex 초기화
+  pthread_cond_init(&sp->slots, NULL);    // 빈 슬록 대기 조건 변수 초기화
+  pthread_cond_init(&sp->items, NULL);    // 아이템 대기 조건 변수 초기화
+}
+
+/* 작업 큐에 클라이언트 연결(connfd)을 축라하며, 큐가 가득 차 있을 경우 빈 슬롯이 생길 때까지 대기하는 함수 */
+void subf_insert(sbuf_t *sp, int item) {
+  pthread_mutex_lock(&sp->mutex);                   // 큐 접근 mutex 잠금
+
+  while (((sp->rear + 1) % sp->n) == sp->front) {   // 큐가 가득 찬 경우
+    pthread_cond_wait(&sp->slots,&sp->mutex);       // 빈 슬롯이 생길 때 까지 대기
+  }
+
+  sp->buf[sp->rear] = item;                         // connfd를 rear 위치에 저장
+  sp->rear = (sp->rear + 1) % sp->n;                // rear 인덱스 증가 (원형 회전)
+
+  pthread_cond_signal(&sp->items);                  // 대기 중인 worker thread에게 작업이 생겼음을 알림
+  pthread_mutex_unlock(&sp->mutex);                 // mutex 잠금 해제
+}
+
+/* 작업 큐에서 클라이언트 연결(connfd)을 꺼내어 반환하며, 큐가 비어 있으면 아이템이 들어올 떄까지 대기 */
+int subf_remove(sbuf_t *sp) { 
+  pthread_mutex_lock(&sp->mutex);                   // 큐 접근 잠금
+
+  while (sp->front == sp->rear) {                   // 큐가 비어있는 경우
+    pthread_cond_wait(&sp->items, &sp->mutex);      // 아이템이 들어올 때까지 대기
+  }
+  
+  int item = sp->buf[sp->front];                    // front 위치의 connfd 가져오기
+  sp->front = (sp->front + 1) % sp-> n;             // front index 증가 (원형 회전)
+  
+  pthread_cond_signal(&sp->slots);                  // 대기 중인 메인 스레드에게 공간이 생겼음을 알림
+  pthread_mutex_unlock(&sp->mutex);                 // 잠금 해제
+
+  return item;                                      // connfd 반환
+}
+
+/* 
+  클라이언트 연결을 반복적으로 처리하는 worker Thread의 작업 루틴 함수
+  메인 함수에서 스레드 생성 시 이 함수를 루틴으로 등록하여 각 스레드가 요청을 처리하도록 한다.
+*/
+void *thread(void *vargp) {
+  pthread_detach(pthread_self());
+
+  while (1) {
+    int connfd = subf_remove(&sbuf);                // 작업 꺼냄
+    doit(connfd);                                   // 요청 처리
+    close(connfd);                                  // 소켓 닫기
+  }
 }
